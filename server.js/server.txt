@@ -1,0 +1,248 @@
+const express = require('express');
+const session = require('express-session');
+const SQLiteStore = require('connect-sqlite3')(session);
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const db = require('./database');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Configuração do multer
+const storage = multer.memoryStorage();
+const upload = multer({
+  storage: storage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Apenas imagens permitidas'));
+    }
+  }
+});
+
+// Segurança
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "https://api.ipify.org", "https://api.emailjs.com"]
+    }
+  }
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { error: 'Muitas requisições. Tente novamente.' }
+});
+app.use('/api/', limiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Sessão com SQLite
+app.use(session({
+  store: new SQLiteStore({ db: 'sessions.db', dir: __dirname }),
+  secret: process.env.SESSION_SECRET || 'mimobox-' + Math.random().toString(36),
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000
+  }
+}));
+
+// Servir arquivos estáticos
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Middlewares de autenticação
+function requireAuth(req, res, next) {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'Login necessário' });
+  }
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.session.userId || !req.session.isAdmin) {
+    return res.status(403).json({ error: 'Acesso restrito' });
+  }
+  next();
+}
+
+// ==================== ROTAS ====================
+
+// Login
+app.post('/api/login', (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Campos obrigatórios' });
+  
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  if (!user) return res.status(401).json({ error: 'Email não encontrado' });
+  
+  const valid = bcrypt.compareSync(password, user.password);
+  if (!valid) return res.status(401).json({ error: 'Senha incorreta' });
+  
+  req.session.userId = user.id;
+  req.session.isAdmin = user.is_admin === 1;
+  req.session.userName = user.nome;
+  
+  res.json({ success: true, user: { id: user.id, nome: user.nome, email: user.email, isAdmin: user.is_admin === 1 } });
+});
+
+// Cadastro
+app.post('/api/signup', (req, res) => {
+  const { nome, email, password } = req.body;
+  if (!nome || !email || !password) return res.status(400).json({ error: 'Campos obrigatórios' });
+  if (password.length < 6) return res.status(400).json({ error: 'Mínimo 6 caracteres' });
+  
+  const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (exists) return res.status(400).json({ error: 'Email já cadastrado' });
+  
+  const hash = bcrypt.hashSync(password, 10);
+  const result = db.prepare('INSERT INTO users (nome, email, password) VALUES (?, ?, ?)').run(nome, email, hash);
+  
+  req.session.userId = result.lastInsertRowid;
+  req.session.isAdmin = false;
+  req.session.userName = nome;
+  
+  res.json({ success: true, user: { id: result.lastInsertRowid, nome, email, isAdmin: false } });
+});
+
+// Logout
+app.post('/api/logout', (req, res) => {
+  req.session.destroy(err => {
+    if (err) return res.status(500).json({ error: 'Erro ao sair' });
+    res.json({ success: true });
+  });
+});
+
+// Sessão atual
+app.get('/api/session', (req, res) => {
+  if (!req.session.userId) return res.json({ loggedIn: false });
+  const user = db.prepare('SELECT id, nome, email, is_admin FROM users WHERE id = ?').get(req.session.userId);
+  if (!user) return res.json({ loggedIn: false });
+  res.json({ loggedIn: true, user: { id: user.id, nome: user.nome, email: user.email, isAdmin: user.is_admin === 1 } });
+});
+
+// Produtos
+app.get('/api/products', (req, res) => {
+  const products = db.prepare('SELECT * FROM products ORDER BY id DESC').all();
+  const withImages = products.map(p => {
+    const images = db.prepare('SELECT imagem_base64 FROM product_images WHERE product_id = ? ORDER BY ordem').all(p.id);
+    return { ...p, imagens: images.map(i => i.imagem_base64), imagemBase64: images[0]?.imagem_base64 || null };
+  });
+  res.json(withImages);
+});
+
+// Criar produto (admin)
+app.post('/api/products', requireAdmin, upload.array('images', 10), (req, res) => {
+  const { nome, preco, descricao, categoria, cores, tamanhos } = req.body;
+  if (!nome || !preco) return res.status(400).json({ error: 'Nome e preço obrigatórios' });
+  
+  const result = db.prepare('INSERT INTO products (nome, preco, descricao, categoria, cores, tamanhos) VALUES (?, ?, ?, ?, ?, ?)').run(
+    nome, parseFloat(preco), descricao || '', categoria || 'outros', cores || '', tamanhos || ''
+  );
+  
+  if (req.files?.length) {
+    const insert = db.prepare('INSERT INTO product_images (product_id, imagem_base64, ordem) VALUES (?, ?, ?)');
+    req.files.forEach((f, i) => insert.run(result.lastInsertRowid, `data:${f.mimetype};base64,${f.buffer.toString('base64')}`, i));
+  }
+  
+  res.json({ success: true, id: result.lastInsertRowid });
+});
+
+// Atualizar produto (admin)
+app.put('/api/products/:id', requireAdmin, upload.array('images', 10), (req, res) => {
+  const product = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+  if (!product) return res.status(404).json({ error: 'Não encontrado' });
+  
+  const { nome, preco, descricao, categoria, cores, tamanhos } = req.body;
+  db.prepare('UPDATE products SET nome=?, preco=?, descricao=?, categoria=?, cores=?, tamanhos=? WHERE id=?').run(
+    nome || product.nome, preco ? parseFloat(preco) : product.preco, descricao || product.descricao,
+    categoria || product.categoria, cores || product.cores, tamanhos || product.tamanhos, req.params.id
+  );
+  
+  if (req.files?.length) {
+    db.prepare('DELETE FROM product_images WHERE product_id = ?').run(req.params.id);
+    const insert = db.prepare('INSERT INTO product_images (product_id, imagem_base64, ordem) VALUES (?, ?, ?)');
+    req.files.forEach((f, i) => insert.run(req.params.id, `data:${f.mimetype};base64,${f.buffer.toString('base64')}`, i));
+  }
+  
+  res.json({ success: true });
+});
+
+// Excluir produto (admin)
+app.delete('/api/products/:id', requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM products WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
+// Criar pedido
+app.post('/api/orders', (req, res) => {
+  const { items, subtotal, frete, desconto, total, paymentMethod, coupon, address } = req.body;
+  const orderNumber = (db.prepare('SELECT MAX(order_number) as m FROM orders').get().m || 533) + 1;
+  
+  const result = db.prepare(`INSERT INTO orders (order_number, user_id, subtotal, frete, desconto, total, payment_method, coupon, address_nome, address_rua, address_numero, address_bairro, address_cidade, address_estado, address_cep)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    orderNumber, req.session.userId || null, subtotal, frete, desconto || 0, total, paymentMethod, coupon || '',
+    address.nome, address.rua, address.numero, address.bairro, address.cidade, address.estado, address.cep
+  );
+  
+  const insertItem = db.prepare('INSERT INTO order_items (order_id, product_name, product_price, size, color) VALUES (?, ?, ?, ?, ?)');
+  items.forEach(i => insertItem.run(result.lastInsertRowid, i.nome, i.preco, i.size || 'Único', i.color || ''));
+  
+  res.json({ success: true, orderNumber });
+});
+
+// Meus pedidos
+app.get('/api/orders', requireAuth, (req, res) => {
+  const orders = db.prepare('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC').all(req.session.userId);
+  const withItems = orders.map(o => ({ ...o, items: db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(o.id) }));
+  res.json(withItems);
+});
+
+// Cupons
+app.post('/api/coupons/validate', (req, res) => {
+  const { code, subtotal } = req.body;
+  const coupon = db.prepare('SELECT * FROM coupons WHERE code = ? AND active = 1').get(code?.toUpperCase());
+  if (!coupon) return res.status(404).json({ error: 'Cupom inválido' });
+  if (coupon.min_total > 0 && subtotal < coupon.min_total) return res.status(400).json({ error: `Mínimo R$ ${coupon.min_total.toFixed(2)}` });
+  res.json({ valid: true, coupon: { code: coupon.code, type: coupon.type, value: coupon.value } });
+});
+
+// Estatísticas (admin)
+app.get('/api/admin/stats', requireAdmin, (req, res) => {
+  const visits = db.prepare('SELECT COUNT(*) as c FROM visits').get().c;
+  const orders = db.prepare('SELECT COUNT(*) as c FROM orders').get().c;
+  const revenue = db.prepare('SELECT COALESCE(SUM(total), 0) as t FROM orders').get().t;
+  const recent = db.prepare('SELECT * FROM orders ORDER BY created_at DESC LIMIT 10').all();
+  res.json({ visits, orders, revenue, recentOrders: recent });
+});
+
+// Visita
+app.post('/api/visit', (req, res) => {
+  const ip = req.ip || '0.0.0.0';
+  db.prepare('INSERT INTO visits (ip, page) VALUES (?, ?)').run(ip, req.body.page || '/');
+  res.json({ ok: true });
+});
+
+// Rota catch-all para o frontend
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Iniciar
+app.listen(PORT, () => {
+  console.log(`🚀 MimoBox rodando na porta ${PORT}`);
+});

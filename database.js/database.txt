@@ -1,0 +1,121 @@
+const Database = require('better-sqlite3');
+const path = require('path');
+
+const db = new Database(path.join(__dirname, 'mimobox.db'));
+
+// Habilitar WAL mode para melhor performance
+db.pragma('journal_mode = WAL');
+
+// Criar tabelas
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    is_admin INTEGER DEFAULT 0,
+    address_rua TEXT DEFAULT '',
+    address_numero TEXT DEFAULT '',
+    address_bairro TEXT DEFAULT '',
+    address_cidade TEXT DEFAULT '',
+    address_estado TEXT DEFAULT '',
+    address_cep TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    preco REAL NOT NULL,
+    descricao TEXT DEFAULT '',
+    categoria TEXT DEFAULT 'outros',
+    cores TEXT DEFAULT '',
+    tamanhos TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS product_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    imagem_base64 TEXT NOT NULL,
+    ordem INTEGER DEFAULT 0,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_number INTEGER NOT NULL,
+    user_id INTEGER,
+    subtotal REAL NOT NULL,
+    frete REAL NOT NULL,
+    desconto REAL DEFAULT 0,
+    total REAL NOT NULL,
+    payment_method TEXT NOT NULL,
+    coupon TEXT DEFAULT '',
+    status TEXT DEFAULT 'confirmado',
+    address_nome TEXT NOT NULL,
+    address_rua TEXT NOT NULL,
+    address_numero TEXT NOT NULL,
+    address_bairro TEXT NOT NULL,
+    address_cidade TEXT NOT NULL,
+    address_estado TEXT NOT NULL,
+    address_cep TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    product_name TEXT NOT NULL,
+    product_price REAL NOT NULL,
+    size TEXT DEFAULT 'Único',
+    color TEXT DEFAULT '',
+    quantity INTEGER DEFAULT 1,
+    FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS visits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT,
+    page TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS coupons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL,
+    type TEXT NOT NULL,
+    value REAL NOT NULL,
+    min_total REAL DEFAULT 0,
+    used_count INTEGER DEFAULT 0,
+    max_uses INTEGER DEFAULT 0,
+    active INTEGER DEFAULT 1
+  );
+`);
+
+// Criar admin padrão se não existir
+const bcrypt = require('bcryptjs');
+const adminExists = db.prepare('SELECT id FROM users WHERE is_admin = 1').get();
+if (!adminExists) {
+  const hash = bcrypt.hashSync('717190joca', 10);
+  db.prepare('INSERT INTO users (nome, email, password, is_admin) VALUES (?, ?, ?, 1)').run('Admin', 'jocarodrigues1709@gmail.com', hash);
+  console.log('✅ Admin criado: jocarodrigues1709@gmail.com / 717190joca');
+}
+
+// Criar cupons padrão
+const cuponsExistentes = db.prepare('SELECT COUNT(*) as count FROM coupons').get();
+if (cuponsExistentes.count === 0) {
+  const cupons = [
+    ['MIMO10', 'percent', 10, 0], ['MIMO20', 'percent', 20, 0],
+    ['FRETEGRATIS', 'frete', 100, 0], ['PANTUFA15', 'percent', 15, 0],
+    ['PELUCIA5', 'fixed', 5, 0], ['BOASVINDAS', 'percent', 12, 0],
+    ['NATAL25', 'percent', 25, 0], ['BOX10', 'fixed', 10, 0],
+    ['PROMO50', 'fixed', 50, 200], ['AMIGO30', 'percent', 30, 0]
+  ];
+  const insert = db.prepare('INSERT INTO coupons (code, type, value, min_total) VALUES (?, ?, ?, ?)');
+  cupons.forEach(c => insert.run(...c));
+  console.log('✅ 10 cupons criados');
+}
+
+module.exports = db;
